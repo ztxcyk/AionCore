@@ -5,6 +5,49 @@ use std::path::PathBuf;
 
 use aionui_runtime::resolve_command_path;
 
+use crate::error::OfficeError;
+
+const PRIVATE_PATH_ENV: &str = "AIONUI_OFFICECLI_PRIVATE_PATH";
+
+#[derive(Debug, Clone)]
+pub(crate) struct OfficecliPolicy {
+    private_path: Option<OsString>,
+}
+
+impl OfficecliPolicy {
+    pub(crate) fn from_env() -> Self {
+        Self::from_private_path(std::env::var_os(PRIVATE_PATH_ENV))
+    }
+
+    pub(crate) fn from_private_path(private_path: Option<OsString>) -> Self {
+        Self { private_path }
+    }
+
+    pub(crate) fn is_private(&self) -> bool {
+        self.private_path.is_some()
+    }
+
+    pub(crate) fn configure_command(&self, builder: &mut aionui_runtime::Builder) {
+        if self.is_private() {
+            builder.env("OFFICECLI_SKIP_UPDATE", "1");
+        }
+    }
+
+    pub(crate) fn resolve_with(&self, default: impl FnOnce() -> Option<PathBuf>) -> Result<PathBuf, OfficeError> {
+        if let Some(value) = &self.private_path {
+            let path = PathBuf::from(value);
+            if path.is_absolute() && path.is_file() {
+                return Ok(path);
+            }
+            return Err(OfficeError::ToolNotFound(format!(
+                "{PRIVATE_PATH_ENV} must name an existing absolute OfficeCLI file: {}",
+                path.display()
+            )));
+        }
+        default().ok_or(OfficeError::OfficecliNotFound)
+    }
+}
+
 // The mirror serves the same install scripts and release assets as GitHub
 // (install.sh itself already downloads assets mirror-first). Fetching the
 // script must follow the same order: raw.githubusercontent.com is unreachable
@@ -133,6 +176,26 @@ pub(crate) fn install_command_for_test(platform: OfficecliInstallPlatform) -> Of
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_path_precedes_global_and_invalid_values_never_fall_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global").join("officecli");
+        let private = tmp.path().join("private").join("officecli");
+        write_marker_file(&global);
+        write_marker_file(&private);
+
+        let default = || panic!("私有模式不能搜索全局路径");
+        let policy = OfficecliPolicy::from_private_path(Some(private.as_os_str().to_owned()));
+        assert_eq!(policy.resolve_with(default).unwrap(), private);
+
+        for value in [OsString::new(), tmp.path().join("missing").into_os_string(), OsString::from("relative")] {
+            let policy = OfficecliPolicy::from_private_path(Some(value));
+            assert!(policy.resolve_with(|| panic!("私有模式不能搜索全局路径")).is_err());
+        }
+        let policy = OfficecliPolicy::from_private_path(None);
+        assert_eq!(policy.resolve_with(|| Some(global.clone())).unwrap(), global);
+    }
 
     fn write_marker_file(path: &std::path::Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

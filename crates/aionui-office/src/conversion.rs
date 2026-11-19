@@ -13,7 +13,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::error::OfficeError;
-use crate::officecli_runtime::resolve_officecli_path;
+use crate::officecli_runtime::{OfficecliPolicy, resolve_officecli_path};
 
 pub struct ConversionService {
     officecli_path: Option<String>,
@@ -122,11 +122,20 @@ impl ConversionService {
     }
 
     async fn ppt_to_json(&self, file_path: &str) -> Result<Value, OfficeError> {
+        self.ppt_to_json_with_policy(file_path, &OfficecliPolicy::from_env()).await
+    }
+
+    async fn ppt_to_json_with_policy(
+        &self,
+        file_path: &str,
+        policy: &OfficecliPolicy,
+    ) -> Result<Value, OfficeError> {
         validate_file_exists(file_path)?;
 
-        let officecli = resolve_officecli(&self.officecli_path).await?;
+        let officecli = resolve_officecli_with_policy(&self.officecli_path, policy)?;
 
         let mut builder = CmdBuilder::clean_cli(&officecli);
+        policy.configure_command(&mut builder);
         builder.args(["ppt2json", file_path]);
         let output = builder
             .output()
@@ -232,25 +241,73 @@ fn find_executable(name: &str) -> Option<String> {
     which::which(name).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-async fn resolve_officecli(configured_path: &Option<String>) -> Result<String, OfficeError> {
-    if let Some(path) = configured_path
-        && Path::new(path).exists()
-    {
-        return Ok(path.clone());
-    }
-
-    if let Some(path) = resolve_officecli_path() {
-        return Ok(path.to_string_lossy().into_owned());
-    }
-
-    Err(OfficeError::ToolNotFound(
-        "officecli not installed. Install iOfficeAI/OfficeCli to enable PPT -> JSON conversion".into(),
-    ))
+fn resolve_officecli_with_policy(
+    configured_path: &Option<String>,
+    policy: &OfficecliPolicy,
+) -> Result<PathBuf, OfficeError> {
+    policy
+        .resolve_with(|| {
+            configured_path
+                .as_ref()
+                .filter(|path| Path::new(path).exists())
+                .map(|path| PathBuf::from(path.as_str()))
+                .or_else(|| resolve_officecli_path().map(|path| PathBuf::from(path.to_string_lossy().into_owned())))
+        })
+        .map_err(|error| match error {
+            OfficeError::OfficecliNotFound => OfficeError::ToolNotFound(
+                "officecli not installed. Install iOfficeAI/OfficeCli to enable PPT -> JSON conversion".into(),
+            ),
+            other => other,
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_conversion_ignores_configured_and_global_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configured = tmp.path().join("configured");
+        let private = tmp.path().join("private");
+        std::fs::write(&configured, b"global").unwrap();
+        std::fs::write(&private, b"private").unwrap();
+        let config = Some(configured.to_string_lossy().into_owned());
+
+        let policy = OfficecliPolicy::from_private_path(Some(private.as_os_str().to_owned()));
+        assert_eq!(resolve_officecli_with_policy(&config, &policy).unwrap(), private);
+        for path in [std::ffi::OsString::new(), tmp.path().join("missing").into_os_string()] {
+            let policy = OfficecliPolicy::from_private_path(Some(path));
+            assert!(resolve_officecli_with_policy(&config, &policy).is_err());
+        }
+        let policy = OfficecliPolicy::from_private_path(None);
+        assert_eq!(resolve_officecli_with_policy(&config, &policy).unwrap(), configured);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ppt_conversion_executes_selected_policy_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let configured = tmp.path().join("configured");
+        let private = tmp.path().join("private");
+        let ppt = tmp.path().join("test.pptx");
+        std::fs::write(&configured, "#!/bin/sh\nprintf '\"configured\"'\n").unwrap();
+        std::fs::write(&private, "#!/bin/sh\nprintf '\"private\"'\n").unwrap();
+        for path in [&configured, &private] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(&ppt, b"ppt").unwrap();
+        let service = ConversionService::new(Some(configured.to_string_lossy().into_owned()));
+        let file = ppt.to_str().unwrap();
+        let policy = OfficecliPolicy::from_private_path(Some(private.into_os_string()));
+        assert_eq!(service.ppt_to_json_with_policy(file, &policy).await.unwrap(), "private");
+        let policy = OfficecliPolicy::from_private_path(Some(std::ffi::OsString::new()));
+        assert!(service.ppt_to_json_with_policy(file, &policy).await.is_err());
+        let policy = OfficecliPolicy::from_private_path(None);
+        assert_eq!(service.ppt_to_json_with_policy(file, &policy).await.unwrap(), "configured");
+    }
 
     #[test]
     fn validate_file_exists_nonexistent() {
@@ -331,8 +388,8 @@ mod tests {
         std::fs::create_dir_all(legacy_bin.parent().unwrap()).unwrap();
         std::fs::write(&legacy_bin, b"#!/bin/sh\nexit 0\n").unwrap();
 
-        if let Ok(resolved) = resolve_officecli(&None).await {
-            assert_ne!(resolved, legacy_bin.to_string_lossy());
+        if let Ok(resolved) = resolve_officecli_with_policy(&None, &OfficecliPolicy::from_private_path(None)) {
+            assert_ne!(resolved, legacy_bin);
         }
     }
 

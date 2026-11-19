@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use crate::error::OfficeError;
-use crate::officecli_runtime::{OFFICECLI_LATEST_RELEASE_URL, install_command, resolve_officecli_path};
+use crate::officecli_runtime::{OFFICECLI_LATEST_RELEASE_URL, OfficecliPolicy, install_command, resolve_officecli_path};
 use crate::port::{allocate_port, is_port_listening};
 use crate::types::DocType;
 
@@ -25,6 +25,10 @@ const VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[async_trait::async_trait]
 pub trait ProcessSpawner: Send + Sync {
+    fn is_private_officecli(&self) -> bool {
+        false
+    }
+
     async fn spawn_officecli(
         &self,
         file_path: &str,
@@ -118,7 +122,7 @@ impl OfficecliWatchManager {
         match &result {
             Ok(port) => {
                 self.broadcast_status_for_user(user_id, doc_type, PreviewState::Ready, None);
-                if doc_type == DocType::Ppt {
+                if doc_type == DocType::Ppt && !self.spawner.is_private_officecli() {
                     self.maybe_check_update(doc_type).await;
                 }
                 Ok(*port)
@@ -196,7 +200,7 @@ impl OfficecliWatchManager {
     ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
         match self.spawner.spawn_officecli(resolved, port, doc_type).await {
             Ok(process) => Ok(process),
-            Err(OfficeError::OfficecliNotFound) => {
+            Err(OfficeError::OfficecliNotFound) if !self.spawner.is_private_officecli() => {
                 self.broadcast_status_for_user(user_id, doc_type, PreviewState::Installing, None);
                 self.spawner.install_officecli().await?;
                 self.spawner.spawn_officecli(resolved, port, doc_type).await
@@ -368,11 +372,15 @@ impl Drop for OfficecliWatchManager {
 
 pub struct DefaultProcessSpawner {
     _data_dir: PathBuf,
+    policy: OfficecliPolicy,
 }
 
 impl DefaultProcessSpawner {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { _data_dir: data_dir }
+        Self {
+            _data_dir: data_dir,
+            policy: OfficecliPolicy::from_env(),
+        }
     }
 }
 
@@ -402,18 +410,30 @@ impl ProcessHandle for TokioProcessHandle {
 
 #[async_trait::async_trait]
 impl ProcessSpawner for DefaultProcessSpawner {
+    fn is_private_officecli(&self) -> bool {
+        self.policy.is_private()
+    }
+
     async fn spawn_officecli(
         &self,
         file_path: &str,
         port: u16,
         _doc_type: DocType,
     ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
-        let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
-        if !officecli_supports_watch(&officecli).await {
-            return Err(OfficeError::OfficecliNotFound);
+        let officecli = self.policy.resolve_with(resolve_officecli_path)?;
+        if !officecli_supports_watch(&officecli, &self.policy).await {
+            return Err(if self.policy.is_private() {
+                OfficeError::StartFailed(format!(
+                    "private OfficeCLI is unavailable or does not support watch: {}",
+                    officecli.display()
+                ))
+            } else {
+                OfficeError::OfficecliNotFound
+            });
         }
 
         let mut builder = CmdBuilder::new(&officecli);
+        self.policy.configure_command(&mut builder);
         builder
             .arg("watch")
             .arg(file_path)
@@ -423,7 +443,7 @@ impl ProcessSpawner for DefaultProcessSpawner {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let child = builder.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            if e.kind() == std::io::ErrorKind::NotFound && !self.policy.is_private() {
                 OfficeError::OfficecliNotFound
             } else {
                 OfficeError::StartFailed(e.to_string())
@@ -436,6 +456,9 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn install_officecli(&self) -> Result<(), OfficeError> {
+        if self.policy.is_private() {
+            return Err(OfficeError::InstallFailed("private OfficeCLI cannot be installed or updated".into()));
+        }
         let command = install_command();
         tracing::info!(
             platform = std::env::consts::OS,
@@ -460,16 +483,19 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn is_officecli_installed(&self) -> bool {
-        let Some(officecli) = resolve_officecli_path() else {
+        let Ok(officecli) = self.policy.resolve_with(resolve_officecli_path) else {
             return false;
         };
 
-        officecli_supports_watch(&officecli).await
+        officecli_supports_watch(&officecli, &self.policy).await
     }
 
     async fn check_update(&self, _doc_type: DocType) -> Result<(), OfficeError> {
-        let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
-        if !officecli_supports_watch(&officecli).await {
+        if self.policy.is_private() {
+            return Ok(());
+        }
+        let officecli = self.policy.resolve_with(resolve_officecli_path)?;
+        if !officecli_supports_watch(&officecli, &self.policy).await {
             return Err(OfficeError::OfficecliNotFound);
         }
 
@@ -544,14 +570,16 @@ fn normalize_officecli_version(raw: &str) -> String {
         .to_owned()
 }
 
-async fn officecli_supports_watch(officecli: &Path) -> bool {
+async fn officecli_supports_watch(officecli: &Path, policy: &OfficecliPolicy) -> bool {
     let mut version = CmdBuilder::clean_cli(officecli);
+    policy.configure_command(&mut version);
     version.arg("--version");
     if !version.output().await.is_ok_and(|o| o.status.success()) {
         return false;
     }
 
     let mut watch_help = CmdBuilder::clean_cli(officecli);
+    policy.configure_command(&mut watch_help);
     watch_help.args(["watch", "--help"]);
     let ok = watch_help.output().await.is_ok_and(|o| o.status.success());
     if !ok {
@@ -604,6 +632,7 @@ mod tests {
 
     struct MockSpawner {
         installed: AtomicBool,
+        private: bool,
         spawn_count: AtomicU32,
         install_count: AtomicU32,
         update_count: AtomicU32,
@@ -616,6 +645,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 installed: AtomicBool::new(true),
+                private: false,
                 spawn_count: AtomicU32::new(0),
                 install_count: AtomicU32::new(0),
                 update_count: AtomicU32::new(0),
@@ -628,6 +658,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProcessSpawner for MockSpawner {
+        fn is_private_officecli(&self) -> bool {
+            self.private
+        }
+
         async fn spawn_officecli(
             &self,
             _file_path: &str,
@@ -699,6 +733,163 @@ mod tests {
         OfficecliWatchManager::new(spawner, broadcaster)
     }
 
+    #[tokio::test]
+    async fn private_preview_does_not_install_on_missing_binary() {
+        let mut mock = MockSpawner::new();
+        mock.private = true;
+        mock.installed.store(false, Ordering::SeqCst);
+        let spawner = Arc::new(mock);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
+        let result = mgr.start("missing.docx", DocType::Word).await;
+        assert!(result.is_err());
+        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.install_count.load(Ordering::SeqCst), 0);
+        assert!(!broadcaster.events().iter().any(|e| e.data["state"] == "installing"));
+    }
+
+    #[tokio::test]
+    async fn private_ppt_preview_never_checks_for_updates() {
+        let mut mock = MockSpawner::new();
+        mock.private = true;
+        let spawner = Arc::new(mock);
+        let mgr = make_manager(Arc::clone(&spawner), Arc::new(RecordingBroadcaster::new()));
+        mgr.start("test.pptx", DocType::Ppt).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(spawner.update_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn private_spawner_direct_install_and_update_are_blocked() {
+        let spawner = DefaultProcessSpawner {
+            _data_dir: PathBuf::new(),
+            policy: OfficecliPolicy::from_private_path(Some(std::ffi::OsString::new())),
+        };
+        assert!(spawner.install_officecli().await.is_err());
+        assert!(spawner.check_update(DocType::Ppt).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn private_spawner_reports_invalid_path_without_installing() {
+        let spawner = DefaultProcessSpawner {
+            _data_dir: PathBuf::new(),
+            policy: OfficecliPolicy::from_private_path(Some(std::ffi::OsString::new())),
+        };
+        let result = spawner.spawn_officecli("test.docx", 12345, DocType::Word).await;
+        assert!(matches!(result, Err(OfficeError::ToolNotFound(message)) if message.contains("AIONUI_OFFICECLI_PRIVATE_PATH")));
+        assert!(!spawner.is_officecli_installed().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn officecli_child_processes_receive_private_update_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("AIONUI_TEST_OFFICECLI_CHILD").is_some() {
+            use aionui_api_types::ConversionTarget;
+
+            let private = std::env::var_os("AIONUI_OFFICECLI_PRIVATE_PATH").is_some();
+            let expected = if private { "1" } else { "parent-value" };
+            let exe = PathBuf::from(std::env::var_os("AIONUI_TEST_OFFICECLI").unwrap());
+            let log = PathBuf::from(std::env::var_os("AIONUI_TEST_LOG").unwrap());
+            let file = std::env::var("AIONUI_TEST_DOCUMENT").unwrap();
+            let spawner = DefaultProcessSpawner::new(PathBuf::new());
+
+            assert!(spawner.is_officecli_installed().await);
+            let process = spawner.spawn_officecli(&file, 12345, DocType::Ppt).await.unwrap();
+            for _ in 0..100 {
+                if std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| line.starts_with("watch|") && !line.starts_with("watch|--help|"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            process.kill();
+            let service = crate::conversion::ConversionService::new(Some(exe.to_string_lossy().into_owned()));
+            let result = service.convert(&file, ConversionTarget::PptJson).await.unwrap();
+            assert!(result.result.success);
+
+            let entries = std::fs::read_to_string(log).unwrap();
+            let lines: Vec<_> = entries.lines().collect();
+            assert_eq!(lines.len(), 6, "{entries}");
+            assert_eq!(lines.iter().filter(|line| line.starts_with("--version|")).count(), 2);
+            assert_eq!(lines.iter().filter(|line| line.starts_with("watch|--help|")).count(), 2);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("watch|") && !line.starts_with("watch|--help|"))
+                    .count(),
+                1
+            );
+            assert_eq!(lines.iter().filter(|line| line.starts_with("ppt2json|")).count(), 1);
+            assert!(lines.iter().all(|line| line.ends_with(&format!("|{expected}"))), "{entries}");
+            assert_eq!(std::env::var("OFFICECLI_SKIP_UPDATE").unwrap(), "parent-value");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("officecli");
+        let document = tmp.path().join("test.pptx");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$1\" \"$2\" \"$OFFICECLI_SKIP_UPDATE\" >> \"$AIONUI_TEST_LOG\"\nif [ \"$1\" = ppt2json ]; then printf '{\"ok\":true}'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&document, b"ppt").unwrap();
+        let mut paths = vec![tmp.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        for private in [true, false] {
+            let log = tmp.path().join(if private { "private.log" } else { "default.log" });
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "watch_manager::tests::officecli_child_processes_receive_private_update_policy",
+                    "--nocapture",
+                ])
+                .env("AIONUI_TEST_OFFICECLI_CHILD", "1")
+                .env("AIONUI_TEST_OFFICECLI", &exe)
+                .env("AIONUI_TEST_LOG", &log)
+                .env("AIONUI_TEST_DOCUMENT", &document)
+                .env("OFFICECLI_SKIP_UPDATE", "parent-value")
+                .env("PATH", std::env::join_paths(&paths).unwrap());
+            if private {
+                child.env("AIONUI_OFFICECLI_PRIVATE_PATH", &exe);
+            } else {
+                child.env_remove("AIONUI_OFFICECLI_PRIVATE_PATH");
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("running 1 test"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_spawner_rejects_binary_without_watch_capability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("officecli");
+        std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = \"--version\" ]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spawner = DefaultProcessSpawner {
+            _data_dir: PathBuf::new(),
+            policy: OfficecliPolicy::from_private_path(Some(path.into_os_string())),
+        };
+        let result = spawner.spawn_officecli("test.docx", 12345, DocType::Word).await;
+        assert!(matches!(result, Err(OfficeError::StartFailed(message)) if message.contains("does not support watch")));
+        assert!(!spawner.is_officecli_installed().await);
+    }
+
     #[test]
     fn session_key_preserves_fields() {
         let key = session_key("user-1", "/path/to/doc.docx", DocType::Word);
@@ -768,7 +959,7 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&officecli, perms).unwrap();
 
-        assert!(!officecli_supports_watch(&officecli).await);
+        assert!(!officecli_supports_watch(&officecli, &OfficecliPolicy::from_private_path(None)).await);
     }
 
     #[tokio::test]
